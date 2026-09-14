@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import cv2
 import numpy as np
 
 from трекер.трек import КадрПоза
+
+РежимХвоста = Literal["ускользающий", "непрерывный"]
 
 
 def сохранить_оверлей(
@@ -17,8 +19,14 @@ def сохранить_оверлей(
     out_path: Path,
     *,
     hud: dict[str, Any] | None = None,
+    режим_хвоста: РежимХвоста = "ускользающий",
     trail_len: int = 90,
-) -> None:
+) -> Path:
+    """Рисует оверлей.
+
+    Хвост — траектория **центра диска** (не отдельной метки):
+    центр считается по всем видимым ArUco (≥2) жёсткой посадкой (Kabsch).
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Не открыть видео для оверлея: {video_path}")
@@ -28,7 +36,6 @@ def сохранить_оверлей(
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # mp4v широко читается; при проблемах — avi
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
     if not writer.isOpened():
@@ -48,7 +55,6 @@ def сохранить_оверлей(
             break
         k = кадры[i]
 
-        # маркеры
         for id_, pts in k.углы_меток_px.items():
             pts_i = pts.astype(np.int32).reshape(-1, 1, 2)
             cv2.polylines(frame, [pts_i], True, (0, 255, 255), 2)
@@ -66,27 +72,41 @@ def сохранить_оверлей(
                 )
 
         if k.cx_px is not None and k.cy_px is not None:
-            cx, cy = int(k.cx_px), int(k.cy_px)
+            cx, cy = int(round(k.cx_px)), int(round(k.cy_px))
             cv2.circle(frame, (cx, cy), 6, (0, 230, 255), -1)
             trail.append((cx, cy))
-            if len(trail) > trail_len:
+            if режим_хвоста == "ускользающий" and len(trail) > trail_len:
                 trail = trail[-trail_len:]
-            for j in range(1, len(trail)):
-                a = int(80 + 175 * j / len(trail))
-                cv2.line(frame, trail[j - 1], trail[j], (255, 180, 0), 2)
-            # ось тела
-            if k.beta_рад is not None and k.мм_на_px:
+
+            n = len(trail)
+            for j in range(1, n):
+                if режим_хвоста == "ускользающий":
+                    # ярче к «сейчас», тусклее к прошлому
+                    f = j / max(n - 1, 1)
+                    color = (
+                        int(80 + 175 * f),   # B
+                        int(60 + 120 * f),   # G
+                        0,                  # R → голубой
+                    )
+                    thickness = 1 if f < 0.4 else 2
+                else:
+                    color = (255, 180, 0)
+                    thickness = 2
+                cv2.line(frame, trail[j - 1], trail[j], color, thickness, cv2.LINE_AA)
+
+            if k.beta_рад is not None:
                 L = 40
                 dx = int(L * np.cos(k.beta_рад))
-                dy = int(-L * np.sin(k.beta_рад))  # y вниз на кадре
-                cv2.arrowedLine(frame, (cx, cy), (cx + dx, cy + dy), (255, 0, 255), 2, tipLength=0.3)
+                dy = int(-L * np.sin(k.beta_рад))
+                cv2.arrowedLine(
+                    frame, (cx, cy), (cx + dx, cy + dy), (255, 0, 255), 2, tipLength=0.3
+                )
 
-        # HUD
         lines = [
             f"t={k.t:.2f}s  markers={k.n_меток}  Q={k.quality:.2f}",
         ]
-        if k.Y_м is not None:
-            lines.append(f"Y={k.Y_м*1000:.1f}mm  Z={k.Z_м*1000:.1f}mm")
+        if k.Y_м is not None and k.Z_м is not None:
+            lines.append(f"Y={k.Y_м * 1000:.1f}mm  Z={k.Z_м * 1000:.1f}mm")
         if k.beta_рад is not None:
             lines.append(f"beta={k.beta_рад:.2f}rad")
         if hud.get("n_об_мин") is not None:
@@ -106,3 +126,35 @@ def сохранить_оверлей(
 
     cap.release()
     writer.release()
+    return out_path
+
+
+def сохранить_оба_оверлея(
+    video_path: Path,
+    кадры: list[КадрПоза],
+    ov_dir: Path,
+    *,
+    hud: dict[str, Any] | None = None,
+) -> list[Path]:
+    """Пишет два ролика: ускользающий хвост и полная траектория."""
+    paths = []
+    paths.append(
+        сохранить_оверлей(
+            video_path,
+            кадры,
+            ov_dir / "трек_хвост.mp4",
+            hud=hud,
+            режим_хвоста="ускользающий",
+        )
+    )
+    # второй проход — снова читает исходник
+    paths.append(
+        сохранить_оверлей(
+            video_path,
+            кадры,
+            ov_dir / "трек_полный.mp4",
+            hud=hud,
+            режим_хвоста="непрерывный",
+        )
+    )
+    return paths
