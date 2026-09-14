@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 import yaml
+from PIL import Image, ImageDraw, ImageFont
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
-from PIL import Image
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 
 
 def сторона_aruco_мм(r_мм: float, cfg: dict[str, Any]) -> float:
@@ -50,6 +53,60 @@ def сгенерировать_маркер_png(словарь, id_: int, px: in
     return Image.fromarray(rgb)
 
 
+@lru_cache(maxsize=1)
+def _путь_ttf() -> Path | None:
+    кандидаты = [
+        Path("/Library/Fonts/DejaVuSans.ttf"),
+        Path("/Library/Fonts/Arial Unicode.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/freefont/FreeSans.ttf"),
+    ]
+    for p in кандидаты:
+        if p.exists():
+            return p
+    return None
+
+
+@lru_cache(maxsize=1)
+def _путь_ttf_bold() -> Path | None:
+    кандидаты = [
+        Path("/Library/Fonts/DejaVuSans-Bold.ttf"),
+        Path("/Library/Fonts/Arial Unicode.ttf"),
+        Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ]
+    for p in кандидаты:
+        if p.exists():
+            return p
+    return _путь_ttf()
+
+
+def _зарегистрировать_шрифты() -> tuple[str, str]:
+    """Возвращает имена шрифтов ReportLab с кириллицей."""
+    regular = "ТрекерSans"
+    bold = "ТрекерSans-Bold"
+    if regular not in pdfmetrics.getRegisteredFontNames():
+        ttf = _путь_ttf()
+        if ttf is None:
+            raise RuntimeError(
+                "Не найден TTF с кириллицей (DejaVuSans / Arial Unicode). "
+                "Установите DejaVu Sans или Arial."
+            )
+        pdfmetrics.registerFont(TTFont(regular, str(ttf)))
+        ttf_b = _путь_ttf_bold() or ttf
+        pdfmetrics.registerFont(TTFont(bold, str(ttf_b)))
+    return regular, bold
+
+
+def _pil_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    path = _путь_ttf_bold() if bold else _путь_ttf()
+    if path is None:
+        return ImageFont.load_default()
+    return ImageFont.truetype(str(path), size)
+
+
 def нарисовать_схему_клейки(
     r_мм: float,
     a_мм: float,
@@ -59,30 +116,26 @@ def нарисовать_схему_клейки(
 ) -> Image.Image:
     """Схема диск + позиции меток (для второй страницы PDF)."""
     size = 900
-    img = np.ones((size, size, 3), dtype=np.uint8) * 255
+    img = Image.new("RGB", (size, size), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
     cx = cy = size // 2
-    scale = (size * 0.42) / r_мм  # px / mm
+    scale = (size * 0.42) / r_мм
 
     def to_px(x_мм: float, y_мм: float) -> tuple[int, int]:
-        # Y вправо, Z вверх на схеме (как на бумаге)
         return int(cx + x_мм * scale), int(cy - y_мм * scale)
 
-    # диск
-    cv2.circle(img, (cx, cy), int(r_мм * scale), (40, 40, 40), 3)
-    # запретная зона
-    cv2.circle(img, (cx, cy), int(запрет * scale), (180, 180, 255), 2)
-    cv2.putText(
-        img,
-        "zona rolika — pustoe",
-        (cx - 120, cy + 8),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (120, 120, 200),
-        1,
-        cv2.LINE_AA,
-    )
-    # окружность меток
-    cv2.circle(img, (cx, cy), int(r_m * scale), (200, 200, 200), 1)
+    Rpx = int(r_мм * scale)
+    draw.ellipse((cx - Rpx, cy - Rpx, cx + Rpx, cy + Rpx), outline=(40, 40, 40), width=3)
+    zpx = int(запрет * scale)
+    draw.ellipse((cx - zpx, cy - zpx, cx + zpx, cy + zpx), outline=(180, 180, 255), width=2)
+    rmpx = int(r_m * scale)
+    draw.ellipse((cx - rmpx, cy - rmpx, cx + rmpx, cy + rmpx), outline=(200, 200, 200), width=1)
+
+    font_s = _pil_font(18)
+    font_m = _pil_font(22, bold=True)
+    font_t = _pil_font(28, bold=True)
+
+    draw.text((cx - 90, cy - 10), "зона ролика — пусто", fill=(120, 120, 200), font=font_s)
 
     for id_, ang in углы.items():
         rad = math.radians(float(ang))
@@ -90,40 +143,23 @@ def нарисовать_схему_клейки(
         y = r_m * math.sin(rad)
         px, py = to_px(x, y)
         half = int(a_мм * scale / 2)
-        cv2.rectangle(img, (px - half, py - half), (px + half, py + half), (0, 0, 0), 2)
-        cv2.putText(
-            img,
-            f"ID={id_}",
-            (px - half, py - half - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 0),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.circle(img, (px, py), 3, (0, 0, 255), -1)
+        draw.rectangle((px - half, py - half, px + half, py + half), outline=(0, 0, 0), width=2)
+        draw.text((px - half, py - half - 28), f"ID={id_}", fill=(0, 0, 0), font=font_m)
+        draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(220, 0, 0))
 
-    cv2.putText(
-        img,
-        f"R={r_мм:.0f} mm  a={a_мм:.1f} mm  r_m={r_m:.1f} mm",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 0, 0),
-        2,
-        cv2.LINE_AA,
+    draw.text(
+        (20, 24),
+        f"R={r_мм:.0f} мм   a={a_мм:.1f} мм   r_m={r_m:.1f} мм",
+        fill=(0, 0, 0),
+        font=font_t,
     )
-    cv2.putText(
-        img,
-        "Kamera SPRAVA — kleit na etu storonu diska",
-        (20, size - 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 100, 0),
-        2,
-        cv2.LINE_AA,
+    draw.text(
+        (20, size - 48),
+        "Камера СПРАВА — клеить на эту сторону диска",
+        fill=(0, 100, 0),
+        font=font_m,
     )
-    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    return img
 
 
 def сохранить_pdf(
@@ -133,26 +169,25 @@ def сохранить_pdf(
     схема: Image.Image,
     текст_шапки: list[str],
 ) -> None:
+    font, font_b = _зарегистрировать_шрифты()
     c = canvas.Canvas(str(путь), pagesize=A4)
     W, H = A4
 
-    # --- страница 1: три квадрата 1:1 ---
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(20 * mm, H - 20 * mm, "Metki ArUco — pechat masshtab 100%")
-    c.setFont("Helvetica", 10)
+    c.setFont(font_b, 14)
+    c.drawString(20 * mm, H - 20 * mm, "Метки ArUco — печать в масштабе 100%")
+    c.setFont(font, 10)
     y = H - 28 * mm
     for line in текст_шапки:
         c.drawString(20 * mm, y, line)
         y -= 5 * mm
 
-    c.setFont("Helvetica", 9)
+    c.setFont(font, 9)
     c.drawString(
         20 * mm,
         y - 2 * mm,
-        "Proverte lineikoy: storona kvadrata = a mm. Ne «vpisat v list».",
+        "Проверьте линейкой: сторона квадрата = a мм. Не «вписать в лист».",
     )
 
-    # три маркера в ряд
     gap = 15 * mm
     x0 = 20 * mm
     y0 = H - 95 * mm
@@ -167,23 +202,21 @@ def сохранить_pdf(
             preserveAspectRatio=True,
             mask="auto",
         )
-        c.setFont("Helvetica-Bold", 11)
+        c.setFont(font_b, 11)
         c.drawString(x, y0 - 6 * mm, f"ID = {id_}")
-        # рамка обрезки
         c.rect(x, y0, a_мм * mm, a_мм * mm, stroke=1, fill=0)
 
-    c.setFont("Helvetica", 9)
-    c.drawString(20 * mm, 25 * mm, "Vyrezat po ramke, nakleit po sheme (stranica 2).")
+    c.setFont(font, 9)
+    c.drawString(20 * mm, 25 * mm, "Вырезать по рамке, наклеить по схеме (страница 2).")
     c.showPage()
 
-    # --- страница 2: схема ---
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(20 * mm, H - 20 * mm, "Shema: kuda kleit (kamera sprava)")
-    c.setFont("Helvetica", 10)
+    c.setFont(font_b, 14)
+    c.drawString(20 * mm, H - 20 * mm, "Схема: куда клеить (камера справа)")
+    c.setFont(font, 10)
     c.drawString(
         20 * mm,
         H - 28 * mm,
-        "Centry metok na okruzhnosti r_m. Zona u rolika — pustaya. Tochnost ±2–3 mm OK.",
+        "Центры меток на окружности r_m. Зона у ролика — пустая. Точность ±2–3 мм нормальна.",
     )
     max_w = W - 40 * mm
     max_h = H - 50 * mm
@@ -268,15 +301,14 @@ def запустить_метки(
 
     схема = нарисовать_схему_клейки(r_мм, a_мм, r_m, углы, запрет)
     шапка = [
-        f"ID: {id_диска}   R = {r_мм:.1f} mm   m = {масса_г:.1f} g   a = {a_мм:.1f} mm",
-        f"r_m = {r_m:.1f} mm   family = {cfg['семейство_aruco']}",
+        f"ID: {id_диска}   R = {r_мм:.1f} мм   m = {масса_г:.1f} г   a = {a_мм:.1f} мм",
+        f"r_m = {r_m:.1f} мм   семейство = {cfg['семейство_aruco']}",
     ]
     if заметка:
-        шапка.append(f"note: {заметка}")
+        шапка.append(f"заметка: {заметка}")
 
     сохранить_pdf(pdf_path, маркеры, a_мм, схема, шапка)
 
-    # актуальная раскладка по умолчанию для обработки
     текущая = out_dir / "раскладка_текущая.yaml"
     with текущая.open("w", encoding="utf-8") as f:
         yaml.safe_dump(раскладка, f, allow_unicode=True, sort_keys=False)
