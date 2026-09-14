@@ -8,14 +8,19 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 from трекер.имя import разобрать_имя, w_из_n
 from трекер.трек import трек_видео, привязать_метры
-from трекер.ряды import построить_таблицу, сводка_ролика
+from трекер.ряды import построить_таблицу
+from трекер.метрики import полная_сводка
 from трекер.экспорт import сохранить_ряд, обновить_сводку
 from трекер.графики import сохранить_графики
 from трекер.оверлей import сохранить_оба_оверлея
+from трекер.отчёт import построить_отчёт
+from трекер.модель import смоделировать, невязка_с_экспериментом
+from трекер.сводка_дня import обновить_карту_и_html
 
 МЕСЯЦЫ = [
     "",
@@ -40,6 +45,21 @@ def дата_по_русски(dt: datetime) -> str:
 
 def дата_съёмки(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime)
+
+
+def _jsonable(obj):
+    """Убрать numpy из мета для json."""
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items() if k not in {"freq", "amp", "пуанкаре", "Y_модель", "Z_модель", "Omega_модель"}}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    return obj
 
 
 def запустить_обработку(*, корень: Path, только: str | None = None) -> int:
@@ -79,11 +99,13 @@ def запустить_обработку(*, корень: Path, только: s
         print(f"Нет видео во «{входящие}». Положите файлы вида n120_d-10.mov")
         return 0
 
+    дни: set[Path] = set()
     ok_n = err_n = 0
     for path in файлы:
         try:
             print(f"\n=== {path.name} ===")
-            _обработать_один(path, корень, r_кол, раскладка, обработанные)
+            день_dir = _обработать_один(path, корень, r_кол, раскладка, обработанные)
+            дни.add(день_dir)
             ok_n += 1
         except Exception as e:
             err_n += 1
@@ -96,6 +118,9 @@ def запустить_обработку(*, корень: Path, только: s
             )
             print(f"ОШИБКА {path.name}: {e} → ошибки/")
 
+    for d in дни:
+        обновить_карту_и_html(d)
+
     print(f"\nГотово: успешно {ok_n}, ошибок {err_n}")
     return 0 if err_n == 0 else 2
 
@@ -106,7 +131,7 @@ def _обработать_один(
     r_кол: float,
     раскладка: dict,
     обработанные: Path,
-) -> None:
+) -> Path:
     params = разобрать_имя(path.name)
     dt = дата_съёмки(path)
     день = дата_по_русски(dt)
@@ -128,35 +153,76 @@ def _обработать_один(
     кадры, info = трек_видео(path, раскладка)
     кадры, origin_meta = привязать_метры(кадры)
 
-    print("  ряды и сводка…")
+    print("  ряды и метрики…")
     табл = построить_таблицу(
         кадры,
         fps=float(info["fps"]),
         масса_г=раскладка.get("масса_г"),
         R_мм=раскладка.get("R_мм"),
     )
-    сводка = сводка_ролика(табл, info)
+    сводка = полная_сводка(табл, info, кадры=кадры, раскладка=раскладка)
+
+    # модель Maas
+    модель_сравнение = None
+    модель_ряд = {}
+    if (
+        w is not None
+        and params.delta_мм is not None
+        and раскладка.get("R_мм")
+        and раскладка.get("масса_г")
+    ):
+        print("  модель Maas…")
+        t_end = float(табл["t_с"][-1]) if len(табл["t_с"]) else 0
+        # стартовые из первых валидных
+        Y0 = Z0 = 0.0
+        Om0 = 1.0
+        for i in range(len(табл["t_с"])):
+            if np.isfinite(табл["Y_м"][i]):
+                Y0 = float(табл["Y_м"][i])
+                Z0 = float(табл["Z_м"][i]) if np.isfinite(табл["Z_м"][i]) else 0.0
+                Om0 = float(табл["Omega_рад_с"][i]) if np.isfinite(табл["Omega_рад_с"][i]) else 1.0
+                break
+        модель_ряд = смоделировать(
+            W_м_с=w,
+            delta_м=params.delta_мм / 1000.0,
+            R_м=float(раскладка["R_мм"]) / 1000.0,
+            масса_кг=float(раскладка["масса_г"]) / 1000.0,
+            t_end=t_end,
+            Y0=Y0,
+            Z0=Z0,
+            Omega0=Om0 if abs(Om0) > 0.05 else 1.0,
+        )
+        модель_сравнение = невязка_с_экспериментом(табл, модель_ряд)
 
     сохранить_ряд(табл, out)
     сохранить_графики(
         табл,
         fig_dir,
         заголовок=f"{path.stem} | n={params.n_об_мин} d={params.delta_мм}",
+        сводка=сводка,
+        модель=модель_сравнение,
     )
 
-    print("  оверлеи (хвост + полный)…")
+    print("  оверлеи…")
     hud = {
         "n_об_мин": params.n_об_мин,
         "delta_мм": params.delta_мм,
         "W_мм_с": None if w is None else w * 1000,
+        "Omega": табл["Omega_рад_с"],
     }
     сохранить_оба_оверлея(path, кадры, ov_dir, hud=hud)
 
-    # превью: первый хороший кадр уже в оверлее; статичный кадр из середины
     мета = {
         "файл": path.name,
         "дата_съёмки": dt.isoformat(timespec="seconds"),
         "дата_папки": день,
+        "пояснения": {
+            "n_об_мин": "Об/мин ведущего колеса из имени файла",
+            "delta_мм": "Смещение оси δ, мм, из имени файла",
+            "W_мм_с": "Линейная скорость привода W=2πn/60·r_кол",
+            "Omega": "Угловая скорость ДИСКА, рад/с",
+            "Y_Z": "Координаты центра диска, м (нуль ≈ первые 2 с)",
+        },
         "n_об_мин": params.n_об_мин,
         "delta_мм": params.delta_мм,
         "W_м_с": w,
@@ -170,40 +236,34 @@ def _обработать_один(
         },
         "видео": info,
         "калибровка_кадра": origin_meta,
-        "сводка": сводка,
+        "сводка": _jsonable(сводка),
+        "модель": _jsonable(модель_сравнение) if модель_сравнение else None,
         "статус": "готово",
     }
     (out / "мета.json").write_text(
         json.dumps(мета, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
 
-    отчёт = [
-        f"Ролик: {path.name}",
-        f"Дата: {день}",
-        f"fps: {info.get('fps')}  кадров: {info.get('n_frames')}",
-        f"n = {params.n_об_мин} об/мин" if params.n_об_мин is not None else "n: не указано",
-        f"δ = {params.delta_мм} мм" if params.delta_мм is not None else "δ: не указано",
-        f"W ≈ {w*1000:.2f} мм/с" if w is not None else "W: нет",
-        f"Диск: R={раскладка.get('R_мм')} мм, m={раскладка.get('масса_г')} г, id={раскладка.get('id_диска')}",
-        "",
-        f"Режим (эвристика): {сводка['режим']}",
-        f"Доля кадров с треком: {сводка['доля_кадров_с_треком']:.1%}",
-        f"Ω среднее: {сводка['Omega_среднее']}",
-        f"σ(Ω): {сводка['Omega_sigma']}",
-        f"σ(Y): {сводка['Y_sigma']}  σ(Z): {сводка['Z_sigma']}",
-        f"f_peak: {сводка['f_peak_Гц']} Гц",
-        "",
-        "Файлы: ряд_по_времени.xlsx, графики/, наложения/трек_хвост.mp4, наложения/трек_полный.mp4",
-        "",
-    ]
-    if сводка["доля_кадров_с_треком"] < 0.3:
-        отчёт.insert(-2, "⚠ Мало кадров с метками — проверьте свет, фокус, размер ArUco, ракурс.")
-    (out / "отчёт.txt").write_text("\n".join(отчёт), encoding="utf-8")
+    (out / "отчёт.txt").write_text(
+        построить_отчёт(
+            имя_файла=path.name,
+            день=день,
+            info=info,
+            params_n=params.n_об_мин,
+            params_d=params.delta_мм,
+            W_мм_с=None if w is None else w * 1000,
+            раскладка=раскладка,
+            r_кол=r_кол,
+            сводка=сводка,
+            модель_сравнение=модель_сравнение,
+        ),
+        encoding="utf-8",
+    )
 
     обновить_сводку(
         день_dir,
         {
-            "ролик": path.stem,
+            "ролик": out.name,
             "файл": path.name,
             "n_об_мин": params.n_об_мин,
             "delta_мм": params.delta_мм,
@@ -214,7 +274,9 @@ def _обработать_один(
             "Omega_sigma": сводка["Omega_sigma"],
             "Y_sigma": сводка["Y_sigma"],
             "Z_sigma": сводка["Z_sigma"],
-            "f_peak_Гц": сводка["f_peak_Гц"],
+            "f_peak_Гц": сводка.get("f_peak_Гц"),
+            "lambda_1_1_с": сводка.get("lambda_1_1_с"),
+            "T_пред_с": сводка.get("T_пред_с"),
             "R_мм": раскладка.get("R_мм"),
             "масса_г": раскладка.get("масса_г"),
             "id_диска": раскладка.get("id_диска"),
@@ -226,3 +288,4 @@ def _обработать_один(
         dest = обработанные / f"{path.stem}_{datetime.now().strftime('%H%M%S')}{path.suffix}"
     shutil.move(str(path), str(dest))
     print(f"OK → прогоны/{день}/ролики/{out.name}/")
+    return день_dir

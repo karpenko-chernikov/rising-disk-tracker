@@ -103,16 +103,23 @@ def сохранить_оверлей(
                 )
 
         lines = [
-            f"t={k.t:.2f}s  markers={k.n_меток}  Q={k.quality:.2f}",
+            f"t={k.t:.2f}s | markers={k.n_меток}/3 | Q={k.quality:.2f}",
         ]
         if k.Y_м is not None and k.Z_м is not None:
-            lines.append(f"Y={k.Y_м * 1000:.1f}mm  Z={k.Z_м * 1000:.1f}mm")
+            lines.append(f"Y={k.Y_м * 1000:.1f}mm Z={k.Z_м * 1000:.1f}mm (center)")
         if k.beta_рад is not None:
-            lines.append(f"beta={k.beta_рад:.2f}rad")
+            lines.append(f"beta={k.beta_рад:.2f}rad (pink arrow)")
+        if hud.get("Omega") is not None and i < len(hud["Omega"]):
+            om = hud["Omega"][i]
+            if om == om:  # not NaN
+                lines.append(f"Omega={om:.2f}rad/s (disk spin)")
         if hud.get("n_об_мин") is not None:
-            lines.append(f"n={hud['n_об_мин']} rpm  d={hud.get('delta_мм')}mm")
+            lines.append(f"n={hud['n_об_мин']}rpm (drive wheel) d={hud.get('delta_мм')}mm")
         if hud.get("W_мм_с") is not None:
-            lines.append(f"W={hud['W_мм_с']:.1f}mm/s")
+            lines.append(f"W={hud['W_мм_с']:.1f}mm/s (drive linear)")
+        # компактная легенда раз в начале
+        if i == 0:
+            lines.append("trail=center path | boxes=ArUco")
         y0 = 28
         for line in lines:
             cv2.putText(frame, line, (16, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (20, 20, 20), 3, cv2.LINE_AA)
