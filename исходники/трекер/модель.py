@@ -16,14 +16,16 @@ def _friction(omega: float) -> float:
 
 
 def _rhs(t, state, W, delta, r, m):
+    """delta — горизонтальный сдвиг контакта (ось Y), м: Y_eff = Y − δ."""
     y, z, omega, beta = state
-    z_eff = z - delta
-    I = m * (0.5 * r**2 + y**2 + z_eff**2)
-    dydt = z_eff * omega
-    dzdt = -y * omega + W
+    y_eff = y - delta
+    I = m * (0.5 * r**2 + y_eff**2 + z**2)
+    dydt = z * omega
+    dzdt = -y_eff * omega + W
     fr = _friction(omega) * omega * m
-    drive = m * W * z_eff * omega
-    domega = (m * G * y - fr - drive) / I
+    drive = m * W * z * omega
+    # гравитационный момент ~ горизонтальному рычагу от вертикали через контакт
+    domega = (m * G * y_eff - fr - drive) / I
     return [dydt, dzdt, domega, omega]
 
 
@@ -95,6 +97,6 @@ def невязка_с_экспериментом(
             "Сравнение с размерной моделью Maas (те же W, δ, R, m; трение k0/k1/k2 по умолчанию). "
             f"RMSE: Y={rY*1000:.2f} мм, Z={rZ*1000:.2f} мм"
             + (f", Ω={rO:.3f} рад/с." if rO is not None else ".")
-            + " Большая невязка ≠ ошибка трекера: модель упрощена, контакт/проскальзывание другие."
+            + " Большая невязка ≠ ошибка трекера: модель упрощена; δ у нас — горизонтальный сдвиг контакта."
         ),
     }
